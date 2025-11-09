@@ -1,5 +1,12 @@
-CODIGO PRUEBA GPS NEO
+PRUEBAS_
 
+
+CARPETAS
+
+PRUEBA GPS:
+Tiene el codigo de prueba GPS NEO
+Se debe tener raspberry pi pico w, cargar libreria de micropyGPS, nrf24l01, ssd1306.
+Cargar en la raspberry programa main.gps.py y cargarlo como main.py
 
 Programa main.py es el base o configurable
 Libreria nombrada: micropyGPS es la libreria del modulo GPS
