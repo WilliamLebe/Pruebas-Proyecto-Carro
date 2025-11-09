@@ -1,3 +1,10 @@
+# ====== Pico 2 W: GPS (NEO-6M) + OLED SSD1306 ======
+# WILLIAM LEON
+# INGENIERIA EN TELECOMUNICACIONES
+# OLED I2C1: GP14 SDA, GP15 SCL
+# GPS UART1: GP4 TX, GP5 RX
+# ====================================================
+
 from machine import Pin, UART, I2C
 import time
 from ssd1306 import SSD1306_I2C
@@ -122,3 +129,4 @@ while True:
     mostrar_en_oled_y_consola(lineas)
 
     time.sleep_ms(50)
+
