@@ -23,6 +23,14 @@ CARPETAS:
 INTERFAZ 
   https://lovable.dev/projects/98577534-eb0b-453c-b046-8900f981caf9
 
+  URL DE YOUTUBE:
+
+VIDEO CARRO V1
+https://youtu.be/-Ustwxty02g
+
+VIDEO FINAL CARRO RC
+https://youtu.be/sU1vbSttK6A
+
 •	Librerias:
   * micropyGPS para el uso del GPS.
   * nrf24l01 para el uso de la antena nrf.
