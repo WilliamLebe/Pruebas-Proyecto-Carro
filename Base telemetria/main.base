@@ -1,0 +1,799 @@
+# ==========================
+# BASE TELEMETRICA – PICO W
+# RX por NRF24 + WiFi + HTTP
+# Dashboard local + envío servidor profesor
+# ==========================
+from machine import Pin, SPI, I2C, UART
+import network
+import time
+import struct
+import ujson as json
+import usocket as socket
+
+from ssd1306 import SSD1306_I2C
+
+# -------------------- CONFIG WiFi / SERVIDOR PROF --------------------
+SSID       = "RACE_2025"
+PASSWORD   = "987654321"
+
+IP_SERVIDOR = "10.10.10.10"
+PUERTO      = 5000               # Puerto HTTP del profesor
+
+CAR_ID    = "WILCAR"
+TEAM_NAME = "William UMNG"
+
+try:
+    import urequests
+except:
+    urequests = None
+
+# -------------------- UART PC --------------------
+uart_pc = UART(
+    0,
+    baudrate=9600,
+    tx=Pin(0),
+    rx=Pin(1)
+)
+
+# -------------------- OLED 128×32 --------------------
+i2c = I2C(1, scl=Pin(15), sda=Pin(14), freq=400000)
+oled = SSD1306_I2C(128, 32, i2c)
+
+def oled_status(ip, total, ultimo, tel_ok, wifi_ok):
+    oled.fill(0)
+    oled.text("BASE WILCAR", 0, 0)
+    oled.text("IP: {}".format(ip), 0, 8)
+    oled.text("Pkts:{} Ult:{}".format(total, ultimo), 0, 16)
+    oled.text("Tel_C:{} WiFi:{}".format(
+        "OK" if tel_ok else "--",
+        "OK" if wifi_ok else "--"), 0, 24)
+    oled.show()
+
+# -------------------- NRF24 parámetros --------------------
+ADDR = b'CARRO'    # Debe coincidir con CARRO TX
+CHAN = 100
+PAYL = 32
+
+try:
+    spi = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4), baudrate=8000000)
+except:
+    spi = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4), baudrate=1000000)
+
+csn = Pin(5, Pin.OUT, value=1)
+ce  = Pin(6, Pin.OUT, value=0)
+
+# Registros
+W_REGISTER   = 0x20
+R_REGISTER   = 0x00
+REGISTER_MASK= 0x1F
+R_RX_PAYLOAD = 0x61
+STATUS       = 0x07
+RF_CH        = 0x05
+RF_SETUP     = 0x06
+EN_AA        = 0x01
+EN_RXADDR    = 0x02
+SETUP_AW     = 0x03
+RX_ADDR_P0   = 0x0A
+TX_ADDR      = 0x10
+RX_PW_P0     = 0x11
+CONFIG       = 0x00
+FIFO_STATUS  = 0x17
+RX_DR        = 0x40
+TX_DS        = 0x20
+MAX_RT       = 0x10
+FLUSH_RX     = 0xE2
+FLUSH_TX     = 0xE1
+
+# -------------------- Funciones NRF --------------------
+def nrf_wr(reg, val):
+    csn(0)
+    spi.write(bytes([W_REGISTER | (reg & REGISTER_MASK), val]))
+    csn(1)
+
+def nrf_rd(reg):
+    csn(0)
+    spi.write(bytes([R_REGISTER | (reg & REGISTER_MASK)]))
+    resp = spi.read(1)
+    csn(1)
+    return resp[0]
+
+def nrf_wr_bytes(reg, data):
+    csn(0)
+    spi.write(bytes([W_REGISTER | (reg & REGISTER_MASK)]) + data)
+    csn(1)
+
+def nrf_flush_all():
+    csn(0); spi.write(bytes([FLUSH_RX])); csn(1)
+    csn(0); spi.write(bytes([FLUSH_TX])); csn(1)
+    nrf_wr(STATUS, RX_DR | TX_DS | MAX_RT)
+
+def nrf_init_rx():
+    nrf_wr(CONFIG, 0x0C)      # CRC ON, PWR_DOWN
+    nrf_wr(SETUP_AW, 0x03)    # 5 bytes de dirección
+    nrf_wr(EN_AA, 0x00)       # sin AutoACK
+    nrf_wr(EN_RXADDR, 0x01)   # Pipe 0 habilitado
+    nrf_wr(RF_CH, CHAN)
+
+    # 250 kbps + 0 dBm (igual que el carro)
+    rf = 0x06
+    nrf_wr(RF_SETUP, rf)
+
+    nrf_wr_bytes(RX_ADDR_P0, ADDR)
+    nrf_wr_bytes(TX_ADDR, ADDR)
+    nrf_wr(RX_PW_P0, PAYL)
+
+    nrf_wr(CONFIG, 0x0B)      # PWR_UP + RX_MODE
+    time.sleep_ms(2)
+    nrf_flush_all()
+    ce(1)
+    print("NRF24 RX listo. Canal", CHAN, "ADDR", ADDR, "RF_SETUP=0x%02X" % rf)
+
+
+# -------------------- WiFi --------------------
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+
+def wifi_try_connect():
+    if wlan.isconnected():
+        return
+    print("Conectando WiFi...", SSID)
+    wlan.connect(SSID, PASSWORD)
+    t0 = time.ticks_ms()
+    while (not wlan.isconnected()
+           and time.ticks_diff(time.ticks_ms(), t0) < 15000):
+        time.sleep_ms(200)
+    if wlan.isconnected():
+        print("WiFi OK:", wlan.ifconfig())
+    else:
+        print("No WiFi, operando solo con NRF+UART")
+
+def wifi_retry():
+    if not wlan.isconnected():
+        print("Intentando reconectar WiFi...")
+        try:
+            wlan.connect(SSID, PASSWORD)
+        except:
+            pass
+
+# -------------------- HTTP SERVER (socket) --------------------
+server_socket = None
+
+def init_http_server():
+    global server_socket
+    try:
+        addr = socket.getaddrinfo("0.0.0.0", 8080)[0][-1]
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(addr)
+        s.listen(2)
+        s.settimeout(0.1)
+        server_socket = s
+        print("Servidor HTTP en puerto 8080")
+    except Exception as e:
+        print("Error iniciando HTTP server:", e)
+        server_socket = None
+
+# -------------------- Estado --------------------
+MAX_LAPS_HISTORY = 40
+
+estado = {
+    "car_id": CAR_ID,
+    "team": TEAM_NAME,
+    "pkt_count": 0,
+    "last_type": "-",
+    "wifi_ok": False,
+    "tel_ok": False,
+    "ip": "0.0.0.0",
+    "last_T": None,          # dict con ax,ay,az,lat,lon,vel,time_ms
+    "last_L": None,          # dict lap actual
+    "lap_history": []        # lista de dicts L
+}
+
+pkt_count = 0
+last_type = "-"
+last_car_rx_ms = time.ticks_ms()
+
+CAR_TIMEOUT = 2000      # ms sin paquetes => Tel_C off
+OLED_PERIOD = 200       # ms
+WIFI_PERIOD = 8000      # ms
+
+next_oled = time.ticks_ms()
+next_wifi = time.ticks_ms()
+
+# -------------------- INICIO --------------------
+nrf_init_rx()
+print("NRF24 RX listo. Canal", CHAN, "ADDR", ADDR)
+
+wifi_try_connect()
+ip = wlan.ifconfig()[0] if wlan.isconnected() else "0.0.0.0"
+estado["wifi_ok"] = wlan.isconnected()
+estado["ip"] = ip
+
+oled_status(ip, pkt_count, last_type, False, wlan.isconnected())
+
+init_http_server()
+
+# -------------------- Formatos binarios T / L --------------------
+FMT_T = "<BIhhhiiH"   # tipo, time_ms, ax_i, ay_i, az_i, lat_i, lon_i, vel_i
+FMT_L = "<BHIiiH"     # tipo, lap, lap_time_ms, lat_i, lon_i, vel_i
+
+def send_lap_to_prof(lap_time_ms, lap_number):
+    if urequests is None:
+        print("[PROF] urequests no disponible, no se envia lap")
+        return
+    if not wlan.isconnected():
+        print("[PROF] Sin WiFi, no se envia lap")
+        return
+
+    url = "http://{}:{}/api/lap".format(IP_SERVIDOR, PUERTO)
+    payload = {
+        "car_id": CAR_ID,
+        "team": TEAM_NAME,
+        "lap_time_ms": int(lap_time_ms),
+        "lap_number_debug": int(lap_number)
+    }
+    try:
+        print("[PROF] Enviando lap:", payload)
+        r = urequests.post(url, json=payload)
+        print("[PROF] Resp:", r.status_code, r.text)
+        r.close()
+    except Exception as e:
+        print("[PROF] Error enviando lap:", e)
+
+# -------------------- Parseo de paquetes binarios --------------------
+def procesar_T_bin(data):
+    global estado
+    try:
+        size = struct.calcsize(FMT_T)
+        campos = struct.unpack(FMT_T, data[:size])
+        tipo, time_ms, ax_i, ay_i, az_i, lat_i, lon_i, vel_i = campos
+
+        ax  = ax_i  / 1000.0
+        ay  = ay_i  / 1000.0
+        az  = az_i  / 1000.0
+        lat = lat_i / 1e7
+        lon = lon_i / 1e7
+        vel = vel_i / 100.0
+
+        estado["last_T"] = {
+            "time_ms": time_ms,
+            "ax": ax,
+            "ay": ay,
+            "az": az,
+            "lat": lat,
+            "lon": lon,
+            "vel": vel
+        }
+
+        # Versión ASCII hacia PC (opcional)
+        s = "T,{},{:+.2f},{:+.2f},{:+.2f},{:.6f},{:.6f},{:.1f}\r\n".format(
+            time_ms, ax, ay, az, lat, lon, vel
+        )
+        uart_pc.write(s)
+        print("[RX T]", s.strip())
+
+    except Exception as e:
+        print("[PROC T BIN] Error:", e)
+
+def procesar_L_bin(data):
+    global estado
+    try:
+        size = struct.calcsize(FMT_L)
+        campos = struct.unpack(FMT_L, data[:size])
+        tipo, lap, lap_time_ms, lat_i, lon_i, vel_i = campos
+
+        lat = lat_i / 1e7
+        lon = lon_i / 1e7
+        vel = vel_i / 100.0
+
+        info_lap = {
+            "lap": lap,
+            "lap_time_ms": lap_time_ms,
+            "lat": lat,
+            "lon": lon,
+            "vel": vel
+        }
+        estado["last_L"] = info_lap
+
+        estado["lap_history"].append(info_lap)
+        if len(estado["lap_history"]) > MAX_LAPS_HISTORY:
+            estado["lap_history"].pop(0)
+
+        # Enviar al servidor del profesor
+        send_lap_to_prof(lap_time_ms, lap)
+
+        # Versión ASCII hacia PC
+        s = "L,{},{},{:.6f},{:.6f},{:.1f}\r\n".format(
+            lap, lap_time_ms, lat, lon, vel
+        )
+        uart_pc.write(s)
+        print("[RX L]", s.strip())
+
+    except Exception as e:
+        print("[PROC L BIN] Error:", e)
+
+def procesar_paquete(data):
+    if not data or len(data) == 0:
+        return "?"
+    tipo = data[0]
+    if tipo == 0x54:       # 'T'
+        procesar_T_bin(data)
+        return "T"
+    elif tipo == 0x4C:     # 'L'
+        procesar_L_bin(data)
+        return "L"
+    else:
+        print("[RX] Tipo desconocido:", tipo)
+        return "?"
+
+# -------------------- Dashboard HTML --------------------
+def generar_dashboard_html():
+    return """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Dashboard Telemetría WILCAR</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root {
+    --bg: #020617;
+    --card: #020617;
+    --border: #1f2937;
+    --accent: #06b6d4;
+    --text: #e5e7eb;
+    --soft: #9ca3af;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: radial-gradient(circle at top, #0f172a 0%, #020617 55%, #020617 100%);
+    color: var(--text);
+  }
+  .page {
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 20px 12px 40px;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 26px;
+    color: #7dd3fc;
+  }
+  header p {
+    margin: 3px 0 0;
+    font-size: 13px;
+    color: var(--soft);
+  }
+  .badge {
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(148,163,184,0.6);
+    color: var(--soft);
+  }
+
+  .card {
+    background: rgba(15,23,42,0.96);
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    padding: 14px 16px;
+    box-shadow: 0 12px 35px rgba(0,0,0,0.5);
+  }
+
+  .team-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .team-logo img {
+    max-width: 130px;
+    border-radius: 999px;
+    border: 2px solid var(--accent);
+    background: #020617;
+  }
+
+  .subtitle {
+    font-size: 11px;
+    color: var(--soft);
+    margin-bottom: 10px;
+  }
+  .pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .pill {
+    font-size: 11px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: #020617;
+    border: 1px solid var(--border);
+    color: var(--soft);
+  }
+  .pill strong { color: var(--accent); }
+  .pill.ok { border-color: #22c55e; color: #bbf7d0; }
+  .pill.bad { border-color: #ef4444; color: #fecaca; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+    gap: 16px;
+  }
+  @media (max-width: 850px) {
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    header { flex-direction: column; align-items: flex-start; }
+    .team-card { flex-direction: column-reverse; align-items: flex-start; }
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+  }
+  th, td {
+    padding: 6px 4px;
+    border-bottom: 1px solid #111827;
+    text-align: center;
+  }
+  th {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 10px;
+    color: var(--soft);
+    background: rgba(15,23,42,0.95);
+  }
+  tbody tr:hover {
+    background: rgba(15,23,42,0.9);
+  }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(2,minmax(0,1fr));
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .metric {
+    border-radius: 10px;
+    background: radial-gradient(circle at top, #0f172a 0%, #020617 70%);
+    border: 1px solid #111827;
+    padding: 8px 10px;
+  }
+  .metric-label {
+    font-size: 11px;
+    color: var(--soft);
+    margin-bottom: 3px;
+  }
+  .metric-value {
+    font-size: 16px;
+    font-weight: 600;
+  }
+  .metric-value span {
+    font-size: 11px;
+    color: var(--soft);
+    margin-left: 3px;
+  }
+
+  .log {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--soft);
+    height: 80px;
+    overflow-y: auto;
+    background: #020617;
+    border-radius: 8px;
+    border: 1px dashed #1f2937;
+    padding: 6px 8px;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <div>
+      <h1>Monitor de Telemetría WILCAR</h1>
+      <p>Sistema de monitoreo en tiempo real · William UMNG</p>
+    </div>
+    <div class="badge">Dashboard local · <span id="ipBase">0.0.0.0</span></div>
+  </header>
+
+  <!-- Tarjeta del carro / equipo -->
+  <section class="card team-card">
+    <div>
+      <h2 style="margin:0 0 4px;font-size:16px;">WILCAR · William UMNG</h2>
+      <div class="subtitle" style="margin-bottom:6px;">
+        Carro autónomo de telemetría NRF24L01 + GPS + MPU6050
+      </div>
+      <div class="pill-row">
+        <div class="pill">Car ID: <strong id="carIdTop">WILCAR</strong></div>
+        <div class="pill">Equipo: <strong>William UMNG</strong></div>
+      </div>
+    </div>
+    <div class="team-logo">
+      <img src="/logo.jpg" alt="Logo WILCAR">
+    </div>
+  </section>
+
+  <section class="card" style="margin-bottom:16px;">
+    <h2>Estado general</h2>
+    <div class="subtitle">Información de conexión y telemetría agregada</div>
+    <div class="pill-row">
+      <div class="pill">Car ID: <strong id="carId">CAR_XX</strong></div>
+      <div class="pill">Team: <strong id="teamName">---</strong></div>
+      <div class="pill">Paquetes NRF: <strong id="pkts">0</strong></div>
+      <div class="pill" id="pillTel">Tel_C: --</div>
+      <div class="pill" id="pillWifi">WiFi: --</div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Últimas vueltas</h2>
+      <div class="subtitle">Tramas L (laps) recibidas desde el carro</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Lap</th>
+            <th>Tiempo (ms)</th>
+            <th>Tiempo (s)</th>
+            <th>Lat</th>
+            <th>Lon</th>
+            <th>Vel (km/h)</th>
+          </tr>
+        </thead>
+        <tbody id="tablaLaps">
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Telemetría instantánea</h2>
+      <div class="subtitle">Última trama T recibida</div>
+      <div class="metric-grid">
+        <div class="metric">
+          <div class="metric-label">Aceleración X</div>
+          <div class="metric-value" id="axVal">0.0<span>g</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Aceleración Y</div>
+          <div class="metric-value" id="ayVal">0.0<span>g</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Aceleración Z</div>
+          <div class="metric-value" id="azVal">0.0<span>g</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Velocidad</div>
+          <div class="metric-value" id="velVal">0.0<span>km/h</span></div>
+        </div>
+      </div>
+      <div class="metric-grid">
+        <div class="metric">
+          <div class="metric-label">Latitud</div>
+          <div class="metric-value" id="latVal">0.000000<span>°</span></div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Longitud</div>
+          <div class="metric-value" id="lonVal">0.000000<span>°</span></div>
+        </div>
+      </div>
+      <div class="log" id="logBox">Esperando datos de la BASE...</div>
+    </div>
+  </section>
+</div>
+
+<script>
+  document.getElementById('ipBase').textContent = location.host;
+
+  function badgeState(elem, ok, label) {
+    elem.textContent = label;
+    elem.classList.remove('ok','bad');
+  }
+
+  function addLog(msg) {
+    const box = document.getElementById('logBox');
+    const ts = new Date().toLocaleTimeString();
+    box.textContent = "[" + ts + "] " + msg + "\\n" + box.textContent;
+  }
+
+  function renderEstado(est) {
+    document.getElementById('carId').textContent    = est.car_id || '---';
+    document.getElementById('carIdTop').textContent = est.car_id || '---';
+    document.getElementById('teamName').textContent = est.team || '---';
+    document.getElementById('pkts').textContent     = est.pkt_count || 0;
+
+    badgeState(document.getElementById('pillWifi'),
+               est.wifi_ok, 'WiFi: ' + (est.wifi_ok ? 'OK' : '--'));
+    badgeState(document.getElementById('pillTel'),
+               est.tel_ok, 'Tel_C: ' + (est.tel_ok ? 'OK' : '--'));
+
+    if (est.last_T) {
+      const T = est.last_T;
+      document.getElementById('axVal').innerHTML  = (T.ax || 0).toFixed(2) + '<span>g</span>';
+      document.getElementById('ayVal').innerHTML  = (T.ay || 0).toFixed(2) + '<span>g</span>';
+      document.getElementById('azVal').innerHTML  = (T.az || 0).toFixed(2) + '<span>g</span>';
+      document.getElementById('velVal').innerHTML = (T.vel || 0).toFixed(2) + '<span>km/h</span>';
+      document.getElementById('latVal').innerHTML = (T.lat || 0).toFixed(6) + '<span>°</span>';
+      document.getElementById('lonVal').innerHTML = (T.lon || 0).toFixed(6) + '<span>°</span>';
+    }
+
+    const tbody = document.getElementById('tablaLaps');
+    tbody.innerHTML = '';
+    if (Array.isArray(est.lap_history)) {
+      est.lap_history.slice().reverse().forEach(l => {
+        const tr = document.createElement('tr');
+        const tms = l.lap_time_ms || 0;
+        const ts  = tms / 1000.0;
+        tr.innerHTML =
+          `<td>${l.lap}</td>` +
+          `<td>${tms}</td>` +
+          `<td>${ts.toFixed(3)}</td>` +
+          `<td>${(l.lat || 0).toFixed(6)}</td>` +
+          `<td>${(l.lon || 0).toFixed(6)}</td>` +
+          `<td>${(l.vel || 0).toFixed(2)}</td>`;
+        tbody.appendChild(tr);
+      });
+    }
+  }
+
+  async function actualizar() {
+    try {
+      const res = await fetch('/data');
+      const est = await res.json();
+      renderEstado(est);
+    } catch (e) {
+      addLog('Error al obtener /data: ' + e);
+    }
+  }
+
+  setInterval(actualizar, 1000);
+  actualizar();
+</script>
+</body>
+</html>
+"""
+
+# -------------------- HTTP handler --------------------
+def estado_to_json():
+    out = {
+        "car_id": estado["car_id"],
+        "team": estado["team"],
+        "pkt_count": estado["pkt_count"],
+        "last_type": estado["last_type"],
+        "wifi_ok": estado["wifi_ok"],
+        "tel_ok": estado["tel_ok"],
+        "ip": estado["ip"],
+        "last_T": None,
+        "last_L": None,
+        "lap_history": []
+    }
+    if estado["last_T"] is not None:
+        out["last_T"] = estado["last_T"]
+    if estado["last_L"] is not None:
+        out["last_L"] = estado["last_L"]
+    for l in estado["lap_history"]:
+        out["lap_history"].append(l)
+    return json.dumps(out)
+
+def http_poll():
+    global server_socket
+    if server_socket is None:
+        return
+    try:
+        cl, addr = server_socket.accept()
+    except OSError:
+        return
+    except Exception as e:
+        print("Error accept:", e)
+        return
+
+    try:
+        req = cl.recv(1024)
+        if not req:
+            cl.close()
+            return
+        try:
+            req_line = req.split(b"\r\n",1)[0]
+            method, path, _ = req_line.split(b" ", 2)
+        except:
+            path = b"/"
+
+        if path.startswith(b"/data"):
+            body = estado_to_json()
+            hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+            cl.send(hdr.encode("utf-8"))
+            cl.send(body.encode("utf-8"))
+
+        elif path.startswith(b"/logo.jpg"):
+            try:
+                f = open("logo.jpg", "rb")
+                cl.send(b"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n")
+                while True:
+                    chunk = f.read(512)
+                    if not chunk:
+                        break
+                    cl.send(chunk)
+                f.close()
+            except:
+                cl.send(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+
+        else:
+            html = generar_dashboard_html()
+            hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+            cl.send(hdr.encode("utf-8"))
+            cl.send(html.encode("utf-8"))
+
+    except Exception as e:
+        print("HTTP error:", e)
+    finally:
+        try:
+            cl.close()
+        except:
+            pass
+
+# ===================== BUCLE PRINCIPAL =====================
+while True:
+    now = time.ticks_ms()
+
+    # ---------- LECTURA NRF ----------
+    st = nrf_rd(STATUS)
+    if st & RX_DR:
+        while True:
+            csn(0)
+            spi.write(bytes([R_RX_PAYLOAD]))
+            data = spi.read(PAYL)
+            csn(1)
+
+            nrf_wr(STATUS, RX_DR | TX_DS | MAX_RT)
+
+            print("[NRF RAW]:", data)
+
+            pkt_count += 1
+            estado["pkt_count"] = pkt_count
+            last_car_rx_ms = now
+
+            tipo_pkt = procesar_paquete(data)
+            if tipo_pkt == "T":
+                last_type = "T"
+            elif tipo_pkt == "L":
+                last_type = "L"
+            else:
+                last_type = "?"
+
+            estado["last_type"] = last_type
+
+            if nrf_rd(FIFO_STATUS) & 0x01:
+                break
+
+    # ---------- Estado Tel_C ----------
+    tel_ok = (time.ticks_diff(now, last_car_rx_ms) <= CAR_TIMEOUT)
+    estado["tel_ok"] = tel_ok
+
+    # ---------- WiFi NO bloqueante ----------
+    if time.ticks_diff(now, next_wifi) >= 0:
+        next_wifi = time.ticks_add(now, WIFI_PERIOD)
+        wifi_retry()
+    wifi_ok = wlan.isconnected()
+    estado["wifi_ok"] = wifi_ok
+    ip = wlan.ifconfig()[0] if wifi_ok else "0.0.0.0"
+    estado["ip"] = ip
+
+    # ---------- OLED ----------
+    if time.ticks_diff(now, next_oled) >= 0:
+        next_oled = time.ticks_add(now, OLED_PERIOD)
+        oled_status(ip, pkt_count, last_type, tel_ok, wifi_ok)
+
+    # ---------- HTTP dashboard ----------
+    http_poll()
+
+    time.sleep_ms(5)
