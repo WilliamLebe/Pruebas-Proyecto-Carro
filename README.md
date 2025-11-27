@@ -20,6 +20,9 @@ CARPETAS:
   Cargar en la raspberry 1 programa tx-jostick.py y cargarlo como main.py
   Cargar en la raspberry 2 programa rx-jostick.py y cargarlo como main.py
 
+INTERFAZ 
+  https://lovable.dev/projects/98577534-eb0b-453c-b046-8900f981caf9
+
 •	Librerias:
   * micropyGPS para el uso del GPS.
   * nrf24l01 para el uso de la antena nrf.
