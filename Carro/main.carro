@@ -1,0 +1,808 @@
+# =================================================================
+# WILLIAM LEON - INGENIERIA EN TELECOMUNICACIONES
+# CARRO RX 9 (SAFE MODE, DUAL NRF)
+#
+#   NRF #1 CONTROL : SPI0 SCK GP2, MOSI GP3, MISO GP4, CSN GP5, CE GP6
+#   NRF #2 TLM     : SPI1 SCK GP10, MOSI GP11, MISO GP12, CSN GP13, CE GP18
+#
+#   OLED     : I2C1 SCL GP15, SDA GP14
+#   GPS      : UART1 TX GP8, RX GP9
+#   SERVO    : GP16
+#   ESC      : GP17
+#   TCRT     : GP26 (ADC0)
+#   MPU6050  : I2C0 SCL GP1, SDA GP0
+#
+# TELEMETRIA (por NRF #2, hacia la BASE) en BINARIO:
+#   Paquete T (0x54):
+#       time_ms, ax, ay, az, lat, lon, vel
+#   Paquete L (0x4C):
+#       lap, lap_time_ms, lat, lon, vel
+#
+#   time_ms    -> ticks_ms() del carro
+#   lap_time_ms-> tiempo de vuelta con ticks_ms()
+#   lat  -> grados decimales  (ej: 4.650000)
+#   lon  -> grados decimales  (ej: -74.100000)
+#   vel  -> km/h (ej: 23.4)
+# =================================================================
+from machine import Pin, SPI, I2C, PWM, UART, ADC
+import utime
+import struct
+from ssd1306 import SSD1306_I2C
+from micropyGPS import MicropyGPS
+
+# ==================== OLED ====================
+try:
+    i2c = I2C(1, scl=Pin(15), sda=Pin(14), freq=1_000_000)  # 1 MHz
+except:
+    i2c = I2C(1, scl=Pin(15), sda=Pin(14), freq=400_000)
+oled = SSD1306_I2C(128, 32, i2c)
+
+def draw_main(hora="--:--:--", laps=0, vel_txt="--", sats=0,
+              tcrt_txt="--", rf_ok=True, tlm_ok=False):
+    oled.fill(0)
+    oled.text("Hora: {}".format(hora), 0, 0)
+    oled.text("Laps:{} Vel:{}".format(laps, vel_txt), 0, 8)
+    oled.text("Sats:{} TCRT:{}".format(sats, tcrt_txt), 0, 16)
+    oled.text("RF:OK" if rf_ok else "RF:--", 0, 24)
+    oled.text("TLM:OK" if tlm_ok else "TLM:--", 64, 24)
+    oled.show()
+
+def draw_lap_flash(lap_num, hora, lat, lon):
+    oled.fill(0)
+    oled.text("LAP {}".format(lap_num), 32, 0)
+    oled.text(hora, 18, 8)
+    lat_s = "{:.6f}".format(lat) if lat is not None else "--"
+    lon_s = "{:.6f}".format(lon) if lon is not None else "--"
+    oled.text("Lat:{}".format(lat_s[:12]), 0, 16)
+    oled.text("Lon:{}".format(lon_s[:12]), 0, 24)
+    oled.show()
+
+def oled_ganaste(prom_kmh=None):
+    oled.fill(0)
+    oled.text("!GANASTE!", 20, 6)
+    if prom_kmh is not None:
+        oled.text("Prom:{:.1f}km/h".format(prom_kmh), 0, 20)
+    else:
+        oled.text("Prom: -- km/h", 0, 20)
+    oled.show()
+
+# ==================== MPU6050 (I2C0 GP0/GP1) ====================
+MPU_ADDR = 0x68
+try:
+    i2c_mpu = I2C(0, scl=Pin(1), sda=Pin(0), freq=400_000)
+    HAVE_MPU = True
+except:
+    HAVE_MPU = False
+
+class MPU6050:
+    def __init__(self, i2c, addr=MPU_ADDR):
+        self.i2c = i2c
+        self.addr = addr
+        self._init_ok = False
+        self._init_device()
+
+    def _write_reg(self, reg, val):
+        self.i2c.writeto_mem(self.addr, reg, bytes([val]))
+
+    def _read_regs(self, reg, n):
+        return self.i2c.readfrom_mem(self.addr, reg, n)
+
+    def _init_device(self):
+        try:
+            self._write_reg(0x6B, 0x00)  # wake
+            utime.sleep_ms(10)
+            self._write_reg(0x1B, 0x00)  # gyro  ±250°/s
+            self._write_reg(0x1C, 0x00)  # accel ±2g
+            self._init_ok = True
+        except:
+            self._init_ok = False
+
+    def read(self):
+        if not self._init_ok:
+            return None
+        try:
+            data = self._read_regs(0x3B, 14)
+            if len(data) != 14:
+                return None
+
+            def _i16(h, l):
+                v = (h << 8) | l
+                return v - 0x10000 if v & 0x8000 else v
+
+            ax_raw = _i16(data[0],  data[1])
+            ay_raw = _i16(data[2],  data[3])
+            az_raw = _i16(data[4],  data[5])
+            gx_raw = _i16(data[8],  data[9])
+            gy_raw = _i16(data[10], data[11])
+            gz_raw = _i16(data[12], data[13])
+
+            ax = ax_raw / 16384.0
+            ay = ay_raw / 16384.0
+            az = az_raw / 16384.0
+            gx = gx_raw / 131.0
+            gy = gy_raw / 131.0
+            gz = gz_raw / 131.0
+            return (ax, ay, az, gx, gy, gz)
+        except:
+            return None
+
+mpu = MPU6050(i2c_mpu) if HAVE_MPU else None
+
+MPU_PERIOD_MS      = 50
+ACC_DELTA_MIN_G    = 0.05
+GYRO_DELTA_MIN_DPS = 5.0
+
+last_mpu_sample = None
+next_mpu_ms     = utime.ticks_ms()
+
+def log_mpu(ax, ay, az, gx, gy, gz):
+    print("[MPU] ax:{:+.2f}g ay:{:+.2f}g az:{:+.2f}g  gx:{:+.1f} gy:{:+.1f} gz:{:+.1f} °/s".format(
+        ax, ay, az, gx, gy, gz
+    ))
+
+def mpu_poll(now):
+    global next_mpu_ms, last_mpu_sample
+    if mpu is None:
+        return
+    if utime.ticks_diff(now, next_mpu_ms) < 0:
+        return
+
+    next_mpu_ms = utime.ticks_add(now, MPU_PERIOD_MS)
+    m = mpu.read()
+    if m is None:
+        return
+
+    ax, ay, az, gx, gy, gz = m
+
+    if last_mpu_sample is None:
+        last_mpu_sample = m
+        log_mpu(ax, ay, az, gx, gy, gz)
+        return
+
+    lax, lay, laz, lgx, lgy, lgz = last_mpu_sample
+
+    if (abs(ax - lax) > ACC_DELTA_MIN_G or
+        abs(ay - lay) > ACC_DELTA_MIN_G or
+        abs(az - laz) > ACC_DELTA_MIN_G or
+        abs(gx - lgx) > GYRO_DELTA_MIN_DPS or
+        abs(gy - lgy) > GYRO_DELTA_MIN_DPS or
+        abs(gz - lgz) > GYRO_DELTA_MIN_DPS):
+
+        last_mpu_sample = m
+        log_mpu(ax, ay, az, gx, gy, gz)
+
+# ==================== NRF #1 CONTROL (SPI0) ====================
+ADDR_CTRL      = b'\xe7\xe7\xe7\xe7\xe7'
+NRF1_CHANNEL   = 83
+PAYLOAD_CTRL   = 32
+
+CONFIG, EN_AA, EN_RXADDR, SETUP_AW, SETUP_RETR = 0x00,0x01,0x02,0x03,0x04
+RF_CH, RF_SETUP, STATUS                        = 0x05,0x26,0x07
+RX_ADDR_P0, TX_ADDR                            = 0x0A,0x10
+RX_PW_P0, FIFO_STATUS                          = 0x11,0x17
+RX_DR, TX_DS, MAX_RT                           = 0x40,0x20,0x10
+W_REGISTER, R_REGISTER, REGISTER_MASK          = 0x20,0x00,0x1F
+FLUSH_TX, FLUSH_RX                             = 0xE1,0xE2
+R_RX_PAYLOAD, W_TX_PAYLOAD                     = 0x61,0xA0
+
+try:
+    spi_ctrl = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4), baudrate=8_000_000)
+except:
+    spi_ctrl = SPI(0, sck=Pin(2), mosi=Pin(3), miso=Pin(4), baudrate=1_000_000)
+csn_ctrl = Pin(5, Pin.OUT, value=1)
+ce_ctrl  = Pin(6, Pin.OUT, value=0)
+
+try:
+    led = Pin("LED", Pin.OUT); HAVE_LED = True
+except:
+    try:
+        led = Pin(25, Pin.OUT); HAVE_LED = True
+    except:
+        HAVE_LED = False
+
+def nrf1_reg_write(reg, val):
+    csn_ctrl(0)
+    spi_ctrl.write(bytearray([W_REGISTER | (reg & REGISTER_MASK), val]))
+    csn_ctrl(1)
+
+def nrf1_reg_read(reg):
+    csn_ctrl(0)
+    spi_ctrl.write(bytearray([R_REGISTER | (reg & REGISTER_MASK)]))
+    b = spi_ctrl.read(1)
+    csn_ctrl(1)
+    return b[0]
+
+def nrf1_reg_write_bytes(reg, data):
+    csn_ctrl(0)
+    spi_ctrl.write(bytearray([W_REGISTER | (reg & REGISTER_MASK)]) + data)
+    csn_ctrl(1)
+
+def nrf1_flush():
+    csn_ctrl(0); spi_ctrl.write(bytearray([FLUSH_TX])); csn_ctrl(1)
+    csn_ctrl(0); spi_ctrl.write(bytearray([FLUSH_RX])); csn_ctrl(1)
+    nrf1_reg_write(STATUS, RX_DR | TX_DS | MAX_RT)
+
+def nrf1_init_rx():
+    nrf1_reg_write(CONFIG, 0x0C)
+    nrf1_reg_write(SETUP_AW, 0x03)
+    nrf1_reg_write(EN_AA, 0x01)
+    nrf1_reg_write(EN_RXADDR, 0x01)
+    nrf1_reg_write(SETUP_RETR, 0x3F)
+    nrf1_reg_write(RF_CH, NRF1_CHANNEL & 0x7F)
+    rf_setup = 0x06
+    nrf1_reg_write(RF_SETUP, rf_setup)
+    nrf1_reg_write_bytes(RX_ADDR_P0, ADDR_CTRL)
+    nrf1_reg_write_bytes(TX_ADDR,   ADDR_CTRL)
+    nrf1_reg_write(RX_PW_P0, PAYLOAD_CTRL)
+    nrf1_reg_write(CONFIG, 0x0B)
+    utime.sleep_ms(2)
+    nrf1_flush()
+    ce_ctrl(1)
+
+# ==================== SERVO / ESC ====================
+SERVO_PIN = 16
+servo = PWM(Pin(SERVO_PIN)); servo.freq(50)
+SERVO_MIN_US = 500; SERVO_MAX_US = 2400; PERIOD_US = 20000
+
+def servo_write_deg(angle):
+    angle = max(0, min(180, angle))
+    us = int(SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * (angle / 180.0))
+    duty = int(us * 65535 // PERIOD_US)
+    servo.duty_u16(duty)
+
+ESC_PIN = 17
+esc = PWM(Pin(ESC_PIN)); esc.freq(50)
+ESC_MIN_US = 1000; ESC_MID_US = 1500; ESC_MAX_US = 2000
+
+def esc_write_us(us):
+    us = max(ESC_MIN_US, min(ESC_MAX_US, us))
+    duty = int(us * 65535 // PERIOD_US)
+    esc.duty_u16(duty)
+
+def speed_to_us(percent):
+    percent = max(-100, min(100, percent))
+    return int(ESC_MID_US + (ESC_MAX_US - ESC_MIN_US) * (percent / 100.0))
+
+def dir_to_angle_jst1(txt):
+    t = (txt or "").strip().lower()
+    if "izquierda" in t: return 30
+    if "derecha"   in t: return 150
+    return 90
+
+def dir_to_speed_jst2(txt):
+    t = (txt or "").strip().lower()
+    if "adelante" in t: return 100
+    if "reversa"  in t: return -100
+    return 0
+
+# ==================== GPS ====================
+uart_gps = UART(1, baudrate=9600, tx=Pin(8), rx=Pin(9), timeout=1000)
+gps = MicropyGPS(-5)  # Bogotá
+
+def fmt_hora(ts):
+    try:
+        h, m, s = ts
+        h = int(h); m = int(m); s = int(s)
+        if h == 0 and m == 0 and s == 0:
+            return "--:--:--"
+        return "{:02d}:{:02d}:{:02d}".format(h, m, s)
+    except:
+        return "--:--:--"
+
+def conv_grados(secciones):
+    try:
+        g, m, hemi = secciones[0], secciones[1], secciones[2]
+    except:
+        return None
+    if g == 0 and m == 0:
+        return None
+    dec = g + m / 60.0
+    if hemi in ("S", "W"):
+        dec = -dec
+    return dec
+
+def vel_kmh(v):
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (list, tuple)):
+            if len(v) >= 3:
+                return float(v[2])
+            if len(v) >= 1:
+                return float(v[0]) * 1.852
+        return float(v)
+    except:
+        return None
+
+def gps_poll():
+    n = uart_gps.any()
+    if not n:
+        return
+    data = uart_gps.read(min(n, 128))
+    if not data:
+        return
+    for b in data:
+        try:
+            gps.update(chr(b))
+        except:
+            pass
+
+# ==================== TCRT Detector (meta) ====================
+adc_tcrt = ADC(26)
+
+ALPHA_FILTER      = 0.6
+ALPHA_BASE        = 0.005
+ALPHA_PK          = 0.05
+
+VENTANA_PATRON_MS = 900
+GAP_MAX_MS        = 250
+DEBOUNCE_MS       = 8
+COLOR_TIMEOUT_MS  = 2000
+
+TH_MIN            = 700
+TH_SCALE          = 0.6
+
+INVERT_SIGNAL     = False
+
+filt_v = None
+base_v = None
+pk_ema = 0
+
+def _filtro_y_umbral(v_raw):
+    global filt_v, base_v, pk_ema
+    if filt_v is None:
+        filt_v = v_raw
+        base_v = v_raw
+        pk_ema = 2000
+    else:
+        filt_v = int(filt_v + ALPHA_FILTER * (v_raw - filt_v))
+        base_v = int(base_v + ALPHA_BASE   * (v_raw - base_v))
+    v_hp = filt_v - base_v
+    if INVERT_SIGNAL:
+        v_hp = -v_hp
+    av = abs(v_hp)
+    pk_ema = int(pk_ema + ALPHA_PK * (av - pk_ema))
+    th = max(TH_MIN, int(TH_SCALE * pk_ema))
+    return v_hp, th
+
+state_high       = None
+last_edge_ms     = 0
+color_start_ms   = 0
+
+BLACK_IS_HIGH    = True
+pattern_active   = False
+pattern_edges    = 0
+pattern_start_ms = 0
+
+# ==================== RF parseo CONTROL ====================
+def parse_dirs(s):
+    try:
+        d1 = d2 = None
+        for p in s.split(';'):
+            if ':' not in p:
+                continue
+            k, v = p.split(':', 1)
+            k = k.strip().upper()
+            v = v.strip()
+            if k == "JST1": d1 = v
+            if k == "JST2": d2 = v
+        return d1, d2
+    except:
+        return None, None
+
+# ==================== NRF #2 TELEMETRÍA (SPI1, BINARIO) ====================
+ADDR_TLM       = b'CARRO'
+NRF2_CHANNEL   = 100
+PAYLOAD_TLM    = 32
+NRF2_POWER_DBM = 0
+
+# formatos binarios compartidos con la BASE
+FMT_T = "<BIhhhiiH"   # tipo, time_ms, ax_i, ay_i, az_i, lat_i, lon_i, vel_i
+FMT_L = "<BHIiiH"     # tipo, lap, lap_time_ms, lat_i, lon_i, vel_i
+
+try:
+    spi_tlm = SPI(1, sck=Pin(10), mosi=Pin(11), miso=Pin(12), baudrate=8_000_000)
+except:
+    spi_tlm = SPI(1, sck=Pin(10), mosi=Pin(11), miso=Pin(12), baudrate=1_000_000)
+csn_tlm = Pin(13, Pin.OUT, value=1)
+ce_tlm  = Pin(18, Pin.OUT, value=0)
+
+def nrf2_reg_write(reg, val):
+    csn_tlm(0)
+    spi_tlm.write(bytearray([W_REGISTER | (reg & REGISTER_MASK), val]))
+    csn_tlm(1)
+
+def nrf2_reg_read(reg):
+    csn_tlm(0)
+    spi_tlm.write(bytearray([R_REGISTER | (reg & REGISTER_MASK)]))
+    b = spi_tlm.read(1)
+    csn_tlm(1)
+    return b[0]
+
+def nrf2_reg_write_bytes(reg, data):
+    csn_tlm(0)
+    spi_tlm.write(bytearray([W_REGISTER | (reg & REGISTER_MASK)]) + data)
+    csn_tlm(1)
+
+def nrf2_flush():
+    csn_tlm(0); spi_tlm.write(bytearray([FLUSH_TX])); csn_tlm(1)
+    csn_tlm(0); spi_tlm.write(bytearray([FLUSH_RX])); csn_tlm(1)
+    nrf2_reg_write(STATUS, RX_DR | TX_DS | MAX_RT)
+
+def nrf2_init_tx():
+    nrf2_reg_write(CONFIG, 0x0A)      # EN_CRC=1, PWR_UP=1, PRIM_RX=0
+    nrf2_reg_write(SETUP_AW, 0x03)    # 5 bytes addr
+    nrf2_reg_write(EN_AA, 0x00)       # sin auto-ACK
+    nrf2_reg_write(EN_RXADDR, 0x01)   # pipe0 habilitado
+    nrf2_reg_write(SETUP_RETR, 0x00)  # sin reintentos
+    nrf2_reg_write(RF_CH, NRF2_CHANNEL & 0x7F)
+
+    # 1 Mbps + 0 dBm (de momento, seguro)
+    rf_setup = 0x06
+    nrf2_reg_write(RF_SETUP, rf_setup)
+
+    nrf2_reg_write_bytes(TX_ADDR,    ADDR_TLM)
+    nrf2_reg_write_bytes(RX_ADDR_P0, ADDR_TLM)
+    nrf2_reg_write(RX_PW_P0, PAYLOAD_TLM)
+
+    utime.sleep_ms(2)
+    nrf2_flush()
+    print("NRF2 TLM TX listo, canal {}, ADDR_TLM={}, RF_SETUP=0x{:02X}".format(
+        NRF2_CHANNEL, ADDR_TLM, rf_setup))
+
+
+def nrf2_send(payload):
+    """payload: bytes, se rellena a 32 bytes y se envía por NRF2."""
+    b = payload
+    if len(b) > PAYLOAD_TLM:
+        print("[NRF2 WARN] Payload largo ({}), se recorta a {}".format(
+            len(b), PAYLOAD_TLM))
+        b = b[:PAYLOAD_TLM]
+
+    if len(b) < PAYLOAD_TLM:
+        b = b + b'\x00' * (PAYLOAD_TLM - len(b))
+
+    print("[NRF2 TX LEN]:", len(b))
+
+    # Cargar payload
+    csn_tlm(0)
+    spi_tlm.write(bytearray([W_TX_PAYLOAD]) + b)
+    csn_tlm(1)
+
+    # Pulso de CE para transmitir
+    ce_tlm(1)
+    utime.sleep_us(15)
+    ce_tlm(0)
+
+    # Limpiar flags de TX
+    st = nrf2_reg_read(STATUS)
+    if st & (TX_DS | MAX_RT):
+        nrf2_reg_write(STATUS, TX_DS | MAX_RT)
+
+
+
+# ==================== TELEMETRÍA DE ALTO NIVEL ====================
+TLM_PERIOD_MS = 200
+next_tlm_ms   = utime.ticks_ms()
+
+def enviar_telemetria(now):
+    """
+    Paquete T binario: time_ms, ax, ay, az, lat, lon, vel
+    """
+    global next_tlm_ms, last_mpu_sample
+    if utime.ticks_diff(now, next_tlm_ms) < 0:
+        return
+    next_tlm_ms = utime.ticks_add(now, TLM_PERIOD_MS)
+
+    time_ms = now
+
+    if last_mpu_sample is not None:
+        ax, ay, az, _, _, _ = last_mpu_sample
+    else:
+        ax = ay = az = 0.0
+
+    lat = conv_grados(gps.latitude)
+    lon = conv_grados(gps.longitude)
+    spd = vel_kmh(getattr(gps, "speed", None))
+
+    if lat is None: lat = 0.0
+    if lon is None: lon = 0.0
+    if spd is None: spd = 0.0
+
+    ax_i  = int(ax * 1000)
+    ay_i  = int(ay * 1000)
+    az_i  = int(az * 1000)
+    lat_i = int(lat * 1e7)
+    lon_i = int(lon * 1e7)
+    vel_i = int(spd * 100)
+
+    pkt = struct.pack(
+        FMT_T,
+        0x54,
+        time_ms,
+        ax_i, ay_i, az_i,
+        lat_i, lon_i,
+        vel_i
+    )
+
+    print("[T-TLM]", time_ms, ax, ay, az, lat, lon, spd)
+
+    nrf2_send(pkt)
+
+def enviar_lap_event(vueltas, lap_time_ms, last_lap_lat, last_lap_lon, spd_now):
+    """
+    Paquete L binario: lap, lap_time_ms, lat, lon, vel
+    """
+    lat = last_lap_lat if last_lap_lat is not None else 0.0
+    lon = last_lap_lon if last_lap_lon is not None else 0.0
+    spd = spd_now if spd_now is not None else 0.0
+
+    lat_i = int(lat * 1e7)
+    lon_i = int(lon * 1e7)
+    vel_i = int(spd * 100)
+
+    pkt = struct.pack(
+        FMT_L,
+        0x4C,
+        int(vueltas),
+        int(lap_time_ms),
+        lat_i, lon_i,
+        vel_i
+    )
+
+    print("[L-TLM] lap:", vueltas, "lap_time_ms:", lap_time_ms,
+          "lat:", lat, "lon:", lon, "vel:", spd)
+
+    nrf2_send(pkt)
+
+# ==================== Estado de carrera y RF ====================
+utime.sleep_ms(300)
+nrf1_init_rx()
+nrf2_init_tx()
+
+servo_write_deg(90)
+esc_write_us(ESC_MID_US)
+
+draw_main("INICIAL", 0, "--", 0, "--", rf_ok=False, tlm_ok=False)
+utime.sleep_ms(500)
+
+last_rx_ms = utime.ticks_ms()
+RF_TIMEOUT_MS = 400
+
+VUELTAS_META = 6
+vueltas = 0
+meta = False
+velocidades_vuelta = []
+last_lap_hora = "--:--:--"
+last_lap_lat  = None
+last_lap_lon  = None
+lap_flash_until = 0
+
+race_end_time_ms = None
+lap_start_ms = utime.ticks_ms()
+
+OLED_PERIOD_MS = 100
+next_oled_ms   = utime.ticks_ms()
+LOG_PERIOD_MS  = 2000
+next_log_ms    = utime.ticks_ms()
+
+def reset_race_state(rf_ok):
+    global vueltas, meta, velocidades_vuelta
+    global last_lap_hora, last_lap_lat, last_lap_lon, lap_flash_until
+    global state_high, pattern_active, pattern_edges, pattern_start_ms
+    global color_start_ms, last_edge_ms
+    global lap_start_ms
+
+    vueltas = 0
+    meta = False
+    velocidades_vuelta = []
+    last_lap_hora = "--:--:--"
+    last_lap_lat  = None
+    last_lap_lon  = None
+    lap_flash_until = 0
+
+    state_high       = None
+    pattern_active   = False
+    pattern_edges    = 0
+    pattern_start_ms = 0
+    color_start_ms   = 0
+    last_edge_ms     = 0
+
+    lap_start_ms = utime.ticks_ms()
+
+    servo_write_deg(90)
+    esc_write_us(ESC_MID_US)
+
+    draw_main("INICIAL", 0, "--", 0, "--", rf_ok, False)
+
+# ==================== Bucle principal ====================
+while True:
+    now = utime.ticks_ms()
+
+    # ----- RF CONTROL (NRF1 RX) -----
+    st = nrf1_reg_read(STATUS)
+    rf_event = False
+    if st & RX_DR:
+        latest = None
+        while True:
+            csn_ctrl(0)
+            spi_ctrl.write(bytearray([R_RX_PAYLOAD]))
+            data = spi_ctrl.read(PAYLOAD_CTRL)
+            csn_ctrl(1)
+            latest = data
+            if nrf1_reg_read(FIFO_STATUS) & 0x01:
+                break
+        nrf1_reg_write(STATUS, RX_DR | TX_DS | MAX_RT)
+
+        msg = latest.rstrip(b"\x00")
+        try:
+            s = msg.decode("utf-8")
+        except:
+            s = str(msg)
+
+        j1, j2 = parse_dirs(s)
+        servo_write_deg(dir_to_angle_jst1(j1))
+        esc_write_us(speed_to_us(dir_to_speed_jst2(j2)))
+        last_rx_ms = now
+        rf_event = True
+
+    rf_ok = utime.ticks_diff(now, last_rx_ms) <= RF_TIMEOUT_MS
+
+    if rf_ok:
+        if HAVE_LED:
+            led.value(0)
+    else:
+        esc_write_us(ESC_MID_US)
+        servo_write_deg(90)
+        nrf1_flush()
+        if HAVE_LED:
+            led.value(1)
+        utime.sleep_ms(2)
+        continue
+
+    if rf_event:
+        utime.sleep_ms(1)
+        continue
+
+    # ----- GPS -----
+    gps_poll()
+
+    # ----- TCRT Detector -----
+    v_raw = adc_tcrt.read_u16()
+    v_hp, th = _filtro_y_umbral(v_raw)
+
+    new_state = state_high
+    if v_hp >= th:
+        new_state = True
+    elif v_hp <= -th:
+        new_state = False
+
+    if state_high is None:
+        if new_state is not None:
+            state_high       = new_state
+            color_start_ms   = now
+            pattern_active   = False
+            pattern_edges    = 0
+            pattern_start_ms = 0
+            last_edge_ms     = now
+    else:
+        if new_state != state_high and new_state is not None:
+            if utime.ticks_diff(now, last_edge_ms) >= DEBOUNCE_MS:
+                if not pattern_active:
+                    if state_high == BLACK_IS_HIGH and new_state == (not BLACK_IS_HIGH):
+                        pattern_active   = True
+                        pattern_edges    = 1
+                        pattern_start_ms = now
+                    else:
+                        pattern_active   = False
+                        pattern_edges    = 0
+                        pattern_start_ms = 0
+                else:
+                    if (utime.ticks_diff(now, pattern_start_ms) <= VENTANA_PATRON_MS and
+                        utime.ticks_diff(now, last_edge_ms)    <= GAP_MAX_MS):
+
+                        pattern_edges += 1
+
+                        if pattern_edges >= 3 and new_state == (not BLACK_IS_HIGH):
+                            # ===== VUELTA =====
+                            vueltas += 1
+
+                            lap_now_ms  = now
+                            lap_time_ms = utime.ticks_diff(lap_now_ms, lap_start_ms)
+                            lap_start_ms = lap_now_ms
+
+                            last_lap_hora = fmt_hora(gps.timestamp)
+                            last_lap_lat  = conv_grados(gps.latitude)
+                            last_lap_lon  = conv_grados(gps.longitude)
+                            spd_now = vel_kmh(getattr(gps, "speed", None))
+                            if spd_now is not None:
+                                velocidades_vuelta.append(spd_now)
+
+                            sats_now = gps.satellites_in_use or 0
+
+                            print("\n=== VUELTA {} ===".format(vueltas))
+                            print("Hora:", last_lap_hora,
+                                  "Lap time ms:", lap_time_ms,
+                                  "Lat:", last_lap_lat,
+                                  "Lon:", last_lap_lon,
+                                  "Vel(km/h):", "{:.1f}".format(spd_now) if spd_now is not None else "--",
+                                  "Sats:", sats_now)
+                            print("====================")
+
+                            lap_flash_until = utime.ticks_add(now, 1000)
+
+                            if vueltas >= VUELTAS_META and not meta:
+                                meta = True
+                                prom = (sum(velocidades_vuelta)/len(velocidades_vuelta)) if velocidades_vuelta else None
+                                esc_write_us(ESC_MID_US)
+                                servo_write_deg(90)
+                                oled_ganaste(prom)
+                                print("=== FIN DE CARRERA: GANASTE ===")
+                                race_end_time_ms = now
+
+                            enviar_lap_event(vueltas, lap_time_ms, last_lap_lat, last_lap_lon, spd_now)
+
+                            pattern_active   = False
+                            pattern_edges    = 0
+                            pattern_start_ms = 0
+                    else:
+                        pattern_active   = False
+                        pattern_edges    = 0
+                        pattern_start_ms = 0
+
+                state_high     = new_state
+                last_edge_ms   = now
+                color_start_ms = now
+
+        if pattern_active and utime.ticks_diff(now, pattern_start_ms) > VENTANA_PATRON_MS:
+            pattern_active   = False
+            pattern_edges    = 0
+            pattern_start_ms = 0
+
+        if (state_high is not None and not pattern_active and color_start_ms != 0 and
+            utime.ticks_diff(now, color_start_ms) > COLOR_TIMEOUT_MS):
+            state_high     = None
+            color_start_ms = 0
+
+    if state_high is None:
+        txt_color = "--"
+    else:
+        txt_color = "NEGRO" if state_high == BLACK_IS_HIGH else "BLANCO"
+
+    # ----- MPU -----
+    mpu_poll(now)
+
+    # ----- Reset auto tras GANASTE -----
+    if meta and race_end_time_ms is not None and utime.ticks_diff(now, race_end_time_ms) >= 5000:
+        reset_race_state(rf_ok)
+        race_end_time_ms = None
+        print("=== SISTEMA REINICIADO, LISTO PARA NUEVA CARRERA ===")
+
+    # ----- OLED -----
+    if not meta and utime.ticks_diff(now, next_oled_ms) >= 0:
+        next_oled_ms = utime.ticks_add(now, OLED_PERIOD_MS)
+        if lap_flash_until and utime.ticks_diff(lap_flash_until, now) > 0:
+            draw_lap_flash(vueltas, last_lap_hora, last_lap_lat, last_lap_lon)
+        else:
+            hora = fmt_hora(gps.timestamp)
+            sats = gps.satellites_in_use or 0
+            spd  = vel_kmh(getattr(gps, "speed", None))
+            vtxt = "{:.1f}".format(spd) if spd is not None else "--"
+            draw_main(hora, vueltas, vtxt, sats, txt_color, rf_ok, tlm_ok=True)
+            if lap_flash_until and utime.ticks_diff(lap_flash_until, now) <= 0:
+                lap_flash_until = 0
+
+    # ----- Log periódico -----
+    if not meta and utime.ticks_diff(now, next_log_ms) >= 0:
+        next_log_ms = utime.ticks_add(now, LOG_PERIOD_MS)
+        hora = fmt_hora(gps.timestamp)
+        sats = gps.satellites_in_use or 0
+        spd  = vel_kmh(getattr(gps, "speed", None))
+        vtxt = "{:.1f}".format(spd) if spd is not None else "--"
+        print("[GPS]", hora, " Sats:", sats, " Vel:", vtxt,
+              " Laps:", vueltas, " TCRT:", txt_color)
+
+    # ----- Telemetría periódica T -----
+    enviar_telemetria(now)
+
+    utime.sleep_ms(2)
