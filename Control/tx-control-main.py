@@ -6,7 +6,7 @@
 #
 # Enlace:
 #   - Dirección RF: 0xE7E7E7E7E7
-#   - Canal: 100  (debe coincidir con el CARRO RX v8)
+#   - Canal: 83  (debe coincidir con el CARRO RX v8)
 #   - Potencia: 0 dBm (máxima)
 #
 # Lógica:
@@ -98,7 +98,7 @@ FLUSH_TX, FLUSH_RX, W_TX_PAYLOAD               = 0xE1,0xE2,0xA0
 
 # ===== Parámetros RF (coinciden con el RX) =====
 ADDR      = b'\xe7\xe7\xe7\xe7\xe7'  # 5 bytes
-CHANNEL   = 100                      # <<< IMPORTANTE: igual que CARRO v8
+CHANNEL   = 83                      # <<< IMPORTANTE: igual que CARRO v8
 PAYLOAD   = 32
 
 # ===== utilidades de registro =====
@@ -238,3 +238,4 @@ while True:
     # Periodo de muestreo
     while utime.ticks_diff(utime.ticks_ms(), t0) < PERIOD_MS:
         utime.sleep_ms(1)
+
